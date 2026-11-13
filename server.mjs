@@ -1,8 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
 import session from 'express-session';
-import OpenAI from 'openai';
-import WebSocket from 'ws';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { timingSafeEqual } from 'node:crypto';
@@ -12,12 +10,26 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const port = Number(process.env.PORT || 3030);
 const appName = process.env.APP_NAME || 'Relay';
 const ownerName = process.env.OWNER_NAME || 'the account owner';
+const voiceProvider = (process.env.VOICE_PROVIDER || 'vapi').toLowerCase();
+if (!['vapi', 'openai_live'].includes(voiceProvider)) {
+  console.error('VOICE_PROVIDER must be either vapi or openai_live.');
+  process.exit(1);
+}
 if (process.env.NODE_ENV === 'production' && (!process.env.APP_PASSWORD || !process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 32)) {
   console.error('Refusing to start publicly: set APP_PASSWORD and a SESSION_SECRET of at least 32 characters.');
   process.exit(1);
 }
-const client = process.env.OPENAI_API_KEY
-  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY, webhookSecret: process.env.OPENAI_WEBHOOK_SECRET })
+let OpenAIClient = null;
+let WebSocket = null;
+if (voiceProvider === 'openai_live') {
+  try {
+    const [openai, ws] = await Promise.all([import('openai'), import('ws')]);
+    OpenAIClient = openai.default;
+    WebSocket = ws.default;
+  } catch { console.error('Install the optional openai and ws packages to use VOICE_PROVIDER=openai_live.'); process.exit(1); }
+}
+const client = voiceProvider === 'openai_live' && process.env.OPENAI_API_KEY
+  ? new OpenAIClient({ apiKey: process.env.OPENAI_API_KEY, webhookSecret: process.env.OPENAI_WEBHOOK_SECRET })
   : null;
 const activeCalls = new Map();
 const seenWebhooks = new Set();
@@ -77,8 +89,16 @@ function configMissing() {
   const missing = [];
   if (!process.env.APP_PASSWORD) missing.push('app sign-in password');
   if (process.env.NODE_ENV === 'production' && (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 32)) missing.push('32-character session secret');
-  if (!process.env.OPENAI_API_KEY) missing.push('OpenAI API key');
-  if (!process.env.SIP_PROVIDER_URL || !process.env.SIP_USERNAME || !process.env.SIP_PASSWORD || !process.env.SIP_CALLER_NUMBER) missing.push('SIP trunk settings');
+  if (voiceProvider === 'vapi') {
+    if (!process.env.VAPI_API_KEY) missing.push('Vapi private API key');
+    if (!process.env.VAPI_ASSISTANT_ID) missing.push('Vapi assistant ID');
+    if (!process.env.VAPI_PHONE_NUMBER_ID) missing.push('Vapi phone number ID');
+    if (process.env.INBOUND_ENABLED === 'true' && !process.env.VAPI_WEBHOOK_SECRET) missing.push('Vapi webhook credential');
+  } else {
+    if (!process.env.OPENAI_API_KEY) missing.push('OpenAI API key');
+    if (!process.env.SIP_PROVIDER_URL || !process.env.SIP_USERNAME || !process.env.SIP_PASSWORD || !process.env.SIP_CALLER_NUMBER) missing.push('SIP trunk settings');
+    if (process.env.INBOUND_ENABLED === 'true' && !process.env.OPENAI_WEBHOOK_SECRET) missing.push('OpenAI webhook signing secret');
+  }
   return missing;
 }
 
@@ -106,6 +126,95 @@ async function liveRequest(endpoint, body) {
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data?.error?.message || `Live API request failed (${response.status}).`);
   return data;
+}
+
+async function vapiRequest(endpoint, { method = 'POST', body } = {}) {
+  if (!process.env.VAPI_API_KEY) throw new Error('Add VAPI_API_KEY to the server environment first.');
+  const response = await fetch(`https://api.vapi.ai${endpoint}`, {
+    method,
+    headers: { Authorization: `Bearer ${process.env.VAPI_API_KEY}`, 'Content-Type': 'application/json' },
+    ...(body ? { body: JSON.stringify(body) } : {})
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data?.message || data?.error || `Vapi request failed (${response.status}).`);
+  return data;
+}
+
+function vapiModelOverride(prompt) {
+  return {
+    provider: process.env.VAPI_MODEL_PROVIDER || 'google',
+    model: process.env.VAPI_MODEL || 'gemini-2.5-flash',
+    messages: [{ role: 'system', content: prompt }]
+  };
+}
+
+function vapiAssistantOverrides(prompt, firstMessage) {
+  const voiceProvider = process.env.VAPI_VOICE_PROVIDER || 'vapi';
+  const voice = {
+    provider: voiceProvider,
+    voiceId: process.env.VAPI_VOICE_ID || 'Elliot'
+  };
+  if (voiceProvider === 'vapi') voice.version = Number(process.env.VAPI_VOICE_VERSION || 2);
+  return {
+    model: vapiModelOverride(prompt),
+    transcriber: {
+      provider: process.env.VAPI_TRANSCRIBER_PROVIDER || 'deepgram',
+      model: process.env.VAPI_TRANSCRIBER_MODEL || 'nova-3'
+    },
+    voice,
+    firstMessage
+  };
+}
+
+function vapiStatus(status, endedReason = '') {
+  if (status === 'queued' || status === 'scheduled') return 'starting';
+  if (status === 'ringing') return 'ringing';
+  if (status === 'in-progress' || status === 'forwarding') return 'connected';
+  if (status === 'ended' && String(endedReason).includes('error')) return 'failed';
+  if (status === 'ended') return 'ended';
+  return 'starting';
+}
+
+function secureControlUrl(value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && url.hostname.endsWith('.vapi.ai') ? url.toString() : null;
+  } catch { return null; }
+}
+
+function vapiWebhookAuthorized(req) {
+  const secret = process.env.VAPI_WEBHOOK_SECRET || '';
+  const authorization = req.get('authorization') || '';
+  const provided = Buffer.from(authorization);
+  const expected = Buffer.from(`Bearer ${secret}`);
+  return Boolean(secret) && provided.length === expected.length && timingSafeEqual(provided, expected);
+}
+
+function rememberCall(call) {
+  activeCalls.set(call.id, call);
+  if (activeCalls.size <= 100) return;
+  const completed = [...activeCalls.values()]
+    .filter(item => ['ended', 'failed'].includes(item.status))
+    .sort((a, b) => Date.parse(a.updatedAt || a.createdAt) - Date.parse(b.updatedAt || b.createdAt));
+  while (activeCalls.size > 100 && completed.length) activeCalls.delete(completed.shift().id);
+}
+
+async function syncVapiCalls() {
+  if (voiceProvider !== 'vapi' || !process.env.VAPI_API_KEY) return;
+  const now = Date.now();
+  const running = [...activeCalls.values()].filter(call =>
+    ['starting', 'ringing', 'connected'].includes(call.status) && now - (call.providerCheckedAt || 0) >= 4000
+  );
+  await Promise.all(running.map(async call => {
+    call.providerCheckedAt = now;
+    try {
+      const remote = await vapiRequest(`/call/${encodeURIComponent(call.id)}`, { method: 'GET' });
+      call.status = vapiStatus(remote.status, remote.endedReason);
+      call.controlUrl = secureControlUrl(remote.monitor?.controlUrl) || call.controlUrl || null;
+      call.to = call.to || remote.customer?.number || 'caller';
+      call.updatedAt = remote.updatedAt || new Date().toISOString();
+    } catch { /* Keep the last known state while the provider API is unavailable. */ }
+  }));
 }
 
 function attachSideband(sessionId, call) {
@@ -140,8 +249,9 @@ function ready(req, res, next) {
   next();
 }
 
-app.get('/api/status', requireLogin, (_req, res) => {
-  res.json({ ready: configMissing().length === 0, missing: configMissing(), inboundEnabled: process.env.INBOUND_ENABLED === 'true', activeCalls: [...activeCalls.values()].map(({ ws, ...call }) => call) });
+app.get('/api/status', requireLogin, async (_req, res) => {
+  await syncVapiCalls();
+  res.json({ ready: configMissing().length === 0, missing: configMissing(), provider: voiceProvider, inboundEnabled: process.env.INBOUND_ENABLED === 'true', activeCalls: [...activeCalls.values()].map(({ ws, controlUrl, providerCheckedAt, ...call }) => call) });
 });
 
 app.post('/api/calls', requireLogin, ready, async (req, res) => {
@@ -153,6 +263,30 @@ app.post('/api/calls', requireLogin, ready, async (req, res) => {
   if ([...activeCalls.values()].some(c => ['starting', 'ringing', 'connected'].includes(c.status))) return res.status(409).json({ error: 'Finish the active call before starting another.' });
   lastOutboundAt = Date.now();
   try {
+    if (voiceProvider === 'vapi') {
+      const result = await vapiRequest('/call', { body: {
+        assistantId: process.env.VAPI_ASSISTANT_ID,
+        phoneNumberId: process.env.VAPI_PHONE_NUMBER_ID,
+        customer: { number: to },
+        assistantOverrides: vapiAssistantOverrides(
+          instructions({ purpose: purpose.trim() }),
+          `Hi, I’m ${appName}, an AI assistant calling on behalf of ${ownerName}. Is now a good time to talk?`
+        )
+      } });
+      if (!result?.id) throw new Error('Vapi did not return a call ID.');
+      const call = {
+        id: result.id,
+        direction: 'outbound',
+        to,
+        purpose: purpose.trim(),
+        status: vapiStatus(result.status),
+        controlUrl: secureControlUrl(result.monitor?.controlUrl),
+        createdAt: result.createdAt || new Date().toISOString(),
+        updatedAt: result.updatedAt || new Date().toISOString()
+      };
+      rememberCall(call);
+      return res.status(201).json({ id: result.id, status: call.status, message: 'Call request sent to Vapi.' });
+    }
     const result = await liveRequest('sessions', {
       session: {
         model: 'gpt-live-1',
@@ -174,7 +308,7 @@ app.post('/api/calls', requireLogin, ready, async (req, res) => {
     const id = result?.session?.id;
     if (!id) throw new Error('The voice service did not return a call session.');
     const call = { id, direction: 'outbound', to, purpose: purpose.trim(), status: 'starting', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
-    activeCalls.set(id, call);
+    rememberCall(call);
     attachSideband(id, call);
     return res.status(201).json({ id, status: call.status, message: 'Call request sent to your SIP provider.' });
   } catch (err) {
@@ -186,6 +320,18 @@ app.post('/api/calls/:id/end', requireLogin, ready, async (req, res) => {
   const call = activeCalls.get(req.params.id);
   if (!call) return res.status(404).json({ error: 'Call session not found in this app.' });
   try {
+    if (voiceProvider === 'vapi') {
+      if (!call.controlUrl) {
+        const remote = await vapiRequest(`/call/${encodeURIComponent(call.id)}`, { method: 'GET' });
+        call.controlUrl = secureControlUrl(remote?.monitor?.controlUrl);
+      }
+      if (!call.controlUrl) return res.status(409).json({ error: 'Vapi has not made a call control link available yet. Try again shortly.' });
+      const ended = await fetch(call.controlUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'end-call' }) });
+      if (!ended.ok) throw new Error(`Vapi could not end the call (${ended.status}).`);
+      call.status = 'ended';
+      call.updatedAt = new Date().toISOString();
+      return res.json({ status: 'ended' });
+    }
     await liveRequest(`sessions/${encodeURIComponent(call.id)}/hangup`, {});
     call.status = 'ended';
     call.ws?.close();
@@ -194,6 +340,7 @@ app.post('/api/calls/:id/end', requireLogin, ready, async (req, res) => {
 });
 
 app.post('/webhooks/openai', async (req, res) => {
+  if (voiceProvider !== 'openai_live') return res.status(404).send('OpenAI provider is not active.');
   if (!client || !process.env.OPENAI_WEBHOOK_SECRET) return res.status(503).send('Webhook is not configured.');
   let event;
   try { event = await client.webhooks.unwrap(req.rawBody.toString('utf8'), req.headers); }
@@ -220,13 +367,68 @@ app.post('/webhooks/openai', async (req, res) => {
       }
     });
     const call = { id: sessionId, direction: 'inbound', status: 'connected', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
-    activeCalls.set(sessionId, call);
+    rememberCall(call);
     attachSideband(sessionId, call);
     return res.status(200).send('Accepted.');
   } catch (err) {
     console.error('Could not accept incoming call:', err.message);
     return res.status(500).send('Could not accept call.');
   }
+});
+
+app.post('/webhooks/vapi', async (req, res) => {
+  if (voiceProvider !== 'vapi') return res.status(404).send('Vapi provider is not active.');
+  if (!vapiWebhookAuthorized(req)) return res.status(process.env.VAPI_WEBHOOK_SECRET ? 401 : 503).send('Webhook authentication failed.');
+  const message = req.body?.message || {};
+  const callData = message.call || {};
+  const eventType = message.type;
+
+  if (eventType === 'assistant-request') {
+    if (process.env.INBOUND_ENABLED !== 'true') return res.status(200).json({ error: 'Incoming call answering is disabled.' });
+    if (!process.env.VAPI_ASSISTANT_ID) return res.status(200).json({ error: 'The assistant is not configured.' });
+    const id = callData.id;
+    if (id) {
+      const call = {
+        id,
+        direction: 'inbound',
+        to: callData.customer?.number || 'caller',
+        purpose: 'AI answering',
+        status: 'starting',
+        controlUrl: secureControlUrl(callData.monitor?.controlUrl),
+        createdAt: callData.createdAt || new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      };
+      rememberCall(call);
+    }
+    return res.status(200).json({
+      assistantId: process.env.VAPI_ASSISTANT_ID,
+      assistantOverrides: vapiAssistantOverrides(
+        instructions({ inbound: true }),
+        `Hello, I’m ${appName}, an AI assistant answering on behalf of ${ownerName}. How can I help?`
+      )
+    });
+  }
+
+  if (eventType === 'status-update' || eventType === 'end-of-call-report') {
+    const id = callData.id;
+    if (id) {
+      const old = activeCalls.get(id) || {};
+      const now = new Date().toISOString();
+      const incoming = callData.type === 'inboundPhoneCall' || old.direction === 'inbound';
+      rememberCall({
+        ...old,
+        id,
+        direction: incoming ? 'inbound' : 'outbound',
+        to: old.to || callData.customer?.number || 'caller',
+        purpose: old.purpose || (incoming ? 'AI answering' : 'AI call'),
+        status: eventType === 'end-of-call-report' ? vapiStatus('ended', message.endedReason || callData.endedReason) : vapiStatus(message.status, callData.endedReason),
+        controlUrl: secureControlUrl(callData.monitor?.controlUrl) || old.controlUrl || null,
+        createdAt: old.createdAt || callData.createdAt || now,
+        updatedAt: now
+      });
+    }
+  }
+  return res.status(200).send('Received.');
 });
 
 app.get('/', requireLogin, (_req, res) => res.sendFile(path.join(here, 'public', 'index.html')));
